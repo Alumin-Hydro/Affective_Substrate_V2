@@ -153,7 +153,7 @@ def load_causal_lm(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_kwargs: dict[str, Any] = {
-        "dtype": dtype,
+        "torch_dtype": dtype,
         "trust_remote_code": True,
     }
     tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
