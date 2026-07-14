@@ -3,7 +3,7 @@ name = "affective-substrate-v2"
 version = "0.1.0"
 description = "Phase 0 dynamical substrate and validation gates"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "accelerate>=1.14.0",
     "matplotlib>=3.8",
@@ -11,7 +11,7 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "scipy>=1.12",
-    "torch>=2.13.0",
+    "torch>=2.11.0",
     "transformers>=5.13.1",
 ]
 
@@ -34,3 +34,13 @@ where = ["src"]
 addopts = "-ra"
 pythonpath = [".", "src"]
 testpaths = ["tests"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
