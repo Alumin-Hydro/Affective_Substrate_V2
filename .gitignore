@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.log
+artifacts/figures/*.png
+artifacts/*.json
+artifacts/*.jsonl
+!artifacts/gate_results.json
+!artifacts/kernel_sweep.json
+*.png
+.DS_Store
+CODEX_PROMPT.md

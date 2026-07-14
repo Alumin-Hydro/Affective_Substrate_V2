@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: affective-substrate-v2
+Version: 0.1.0
+Summary: Phase 0 dynamical substrate and validation gates
+Requires-Python: <3.13,>=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: numpy>=1.26
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: scipy>=1.12

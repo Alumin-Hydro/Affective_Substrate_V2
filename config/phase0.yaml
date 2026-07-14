@@ -1,0 +1,90 @@
+substrate:
+  core: hindmarsh_rose
+  k: 4
+  dim_names: [arousal, calm, positive, negative]
+  integrator: rk4
+  dt: 0.1
+  noise_sigma: 0.0
+  seed: 7
+  ic_mode: sane
+  sane_ic_center: 0.5
+  sane_ic_jitter: 0.01
+  custom_ic: null
+  mackey_glass:
+    beta: [0.24, 0.235, 0.245, 0.24]
+    gamma_0: 0.1
+    kappa: 0.01
+    n: 10
+    tau_steps: [170, 180, 190, 200]
+    W:
+      - [0.0, 0.001, -0.001, 0.0]
+      - [0.001, 0.0, 0.0, -0.001]
+      - [-0.001, 0.0, 0.0, 0.001]
+      - [0.0, -0.001, 0.001, 0.0]
+  hindmarsh_rose:
+    a: [1.0, 1.0, 1.0, 1.0]
+    b: [3.0, 3.0, 3.0, 3.0]
+    c: [1.0, 1.0, 1.0, 1.0]
+    d: [5.0, 5.0, 5.0, 5.0]
+    r: [0.006, 0.0062, 0.0058, 0.0061]
+    s: [4.0, 4.0, 4.0, 4.0]
+    x_rest: [-1.6, -1.6, -1.6, -1.6]
+    input_current: [3.25, 3.27, 3.23, 3.26]
+    W:
+      - [0.0, 0.002, 0.0, 0.0]
+      - [0.002, 0.0, 0.0, 0.0]
+      - [0.0, 0.0, 0.0, 0.002]
+      - [0.0, 0.0, 0.002, 0.0]
+  slow:
+    eps: [0.001, 0.0011, 0.0009, 0.00105]
+  kernel:
+    type: hybrid
+    w: 0.9
+    alpha: 0.3
+    s0: 1.0
+    buffer_len: 500
+
+reservoir:
+  dim: 128
+  spectral_radius: 0.95
+  leak_rate: 0.3
+  tau_r: 5.0
+  input_scaling: 0.1
+  density: 0.1
+  x_dim: 4
+  input_dim: 4
+  seed: 17
+
+llm:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  dtype: bfloat16
+  inject_layers: [15, 18, 21, 24]
+  deterministic: true
+  injection:
+    A: [0.1, 0.1, 0.1, 0.1]
+    B: [0.05, 0.05, 0.05, 0.05]
+    s: [1.0, 1.0, 1.0, 1.0]
+    x_baseline: [0.5, 0.5, 0.5, 0.5]
+    y_baseline: [0.5, 0.5, 0.5, 0.5]
+    cap: 8.0
+    slow_use_separate_directions: false
+
+feedback:
+  enabled: true
+  classifier: vad
+  steps_per_turn: 50
+
+gates:
+  lyapunov:
+    lambda_min: 0.01
+    blowup_threshold: 100.0
+    collapse_threshold: 0.001
+    transient: 2000
+    renorm_interval: 20
+    intervals: 200
+    d0: 1.0e-8
+  sensitivity:
+    noise_multiple: 5.0
+    steps: 800
+    emotional_amplitude: 0.25
+    neutral_sigma: 0.0005
