@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.schema import load_config
 from src.llm.directions import DIMS, extract_directions, save_directions
+from src.llm.model_loading import DEFAULT_HF_MIRROR, load_causal_lm
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
@@ -59,6 +59,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional HTTP/HTTPS proxy URL for downloads (e.g. http://127.0.0.1:7890)",
     )
+    parser.add_argument(
+        "--local-model-dir",
+        type=str,
+        default=None,
+        help="Complete local HuggingFace model/snapshot directory (no network needed)",
+    )
+    parser.add_argument(
+        "--hf-mirror",
+        nargs="?",
+        const=DEFAULT_HF_MIRROR,
+        default=None,
+        metavar="URL",
+        help=f"Use an HF mirror; with no URL defaults to {DEFAULT_HF_MIRROR}",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-run extraction even when both output artifacts already exist",
+    )
     return parser.parse_args()
 
 
@@ -71,46 +90,35 @@ def dtype_from_string(name: str) -> torch.dtype:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
-    llm_config = config.llm
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    directions_path = output_dir / "directions.pt"
+    metadata_path = output_dir / "directions_meta.json"
+    if directions_path.exists() and metadata_path.exists() and not args.overwrite:
+        print(
+            f"Reusing existing extraction artifacts: {directions_path} and "
+            f"{metadata_path}. Pass --overwrite to extract again."
+        )
+        return
 
-    if args.proxy:
-        import os
-
-        os.environ.setdefault("HTTP_PROXY", args.proxy)
-        os.environ.setdefault("HTTPS_PROXY", args.proxy)
-        os.environ.setdefault("http_proxy", args.proxy)
-        os.environ.setdefault("https_proxy", args.proxy)
+    config = load_config(args.config)
+    llm_config = config.llm
 
     dtype = dtype_from_string(args.dtype)
     device_arg = args.device
     if device_arg == "auto":
         device_arg = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Loading model {llm_config.model_name} on {device_arg} with dtype {dtype} ...")
-    model_kwargs = {
-        "torch_dtype": dtype,
-        "trust_remote_code": True,
-    }
-    if device_arg in ("cuda", "auto"):
-        model_kwargs["device_map"] = "auto"
-    else:
-        model_kwargs["device_map"] = None
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        llm_config.model_name, trust_remote_code=True
+    source = args.local_model_dir or llm_config.model_name
+    print(f"Loading model {source} on {device_arg} with dtype {dtype} ...")
+    model, tokenizer = load_causal_lm(
+        model_name=llm_config.model_name,
+        device=device_arg,
+        dtype=dtype,
+        local_model_dir=args.local_model_dir,
+        hf_mirror=args.hf_mirror,
+        proxy=args.proxy,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        llm_config.model_name, **model_kwargs
-    )
-    if device_arg == "cpu":
-        model = model.to("cpu")
-    elif device_arg == "mps" and torch.backends.mps.is_available():
-        model = model.to("mps")
-
-    model.eval()
     device = next(model.parameters()).device
     print(f"Model loaded on {device}")
 

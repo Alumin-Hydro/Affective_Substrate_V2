@@ -9,13 +9,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.schema import InjectionConfig, LLMConfig, load_config
 from src.llm.directions import load_directions
 from src.llm.hooks import InjectionHook
+from src.llm.model_loading import DEFAULT_HF_MIRROR, load_causal_lm
 from src.llm.projection import build_reservoir_projection, compute_injection
 from src.memory.reservoir import Reservoir
 from src.substrate import create_core
@@ -79,6 +79,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional HTTP/HTTPS proxy URL for downloads",
     )
+    parser.add_argument(
+        "--local-model-dir",
+        type=str,
+        default=None,
+        help="Complete local HuggingFace model/snapshot directory (no network needed)",
+    )
+    parser.add_argument(
+        "--hf-mirror",
+        nargs="?",
+        const=DEFAULT_HF_MIRROR,
+        default=None,
+        metavar="URL",
+        help=f"Use an HF mirror; with no URL defaults to {DEFAULT_HF_MIRROR}",
+    )
     return parser.parse_args()
 
 
@@ -92,23 +106,9 @@ def dtype_from_string(name: str) -> torch.dtype:
 class MockLM:
     """Minimal mock LLM for calibration on machines without the real 7B model."""
 
-    def __init__(self, d_model: int, num_layers: int, device: torch.device) -> None:
+    def __init__(self, d_model: int, device: torch.device) -> None:
         self.d_model = d_model
-        self.num_layers = num_layers
         self.device = device
-        self.model = type(
-            "MockModel",
-            (),
-            {
-                "layers": [
-                    type("MockLayer", (object,), {"forward": self._layer_forward})
-                    for _ in range(num_layers)
-                ]
-            },
-        )()
-
-    def _layer_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
 
     def __call__(self, **kwargs):
         batch_size = kwargs.get("input_ids", torch.zeros(1, 1)).shape[0]
@@ -129,49 +129,33 @@ class MockLM:
         yield torch.zeros(1, device=self.device, requires_grad=True)
 
 
-def load_model(llm_config: LLMConfig, device: str, dtype: torch.dtype, proxy: str | None):
+def load_model(
+    llm_config: LLMConfig,
+    device: str,
+    dtype: torch.dtype,
+    proxy: str | None = None,
+    local_model_dir: str | None = None,
+    hf_mirror: str | None = None,
+):
     """Load a real or mock model depending on the requested device."""
-
-    if proxy:
-        import os
-
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            os.environ.setdefault(key, proxy)
 
     if device == "mock":
         raise ValueError("use build_mock_model instead of load_model for mock mode")
 
-    device_arg = device
-    if device_arg == "auto":
-        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model_kwargs = {
-        "torch_dtype": dtype,
-        "trust_remote_code": True,
-    }
-    if device_arg in ("cuda", "auto"):
-        model_kwargs["device_map"] = "auto"
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        llm_config.model_name, trust_remote_code=True
+    return load_causal_lm(
+        model_name=llm_config.model_name,
+        device=device,
+        dtype=dtype,
+        local_model_dir=local_model_dir,
+        hf_mirror=hf_mirror,
+        proxy=proxy,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        llm_config.model_name, **model_kwargs
-    )
-    if device_arg == "cpu":
-        model = model.to("cpu")
-    elif device_arg == "mps" and torch.backends.mps.is_available():
-        model = model.to("mps")
-    model.eval()
-    return model, tokenizer
 
 
-def build_mock_model(llm_config: LLMConfig, device: torch.device) -> tuple:
+def build_mock_model(device: torch.device, d_model: int) -> tuple:
     """Build a tokenizer-less mock model and a dummy tokenizer placeholder."""
 
-    num_layers = max(llm_config.inject_layers) + 1
-    d_model = getattr(llm_config, "d_model", 3584)
-    model = MockLM(d_model=d_model, num_layers=num_layers, device=device)
+    model = MockLM(d_model=d_model, device=device)
     tokenizer = type(
         "MockTokenizer",
         (object,),
@@ -184,6 +168,15 @@ def build_mock_model(llm_config: LLMConfig, device: torch.device) -> tuple:
         },
     )()
     return model, tokenizer
+
+
+def build_mock_directions(k: int, num_layers: int, d_model: int = 64) -> np.ndarray:
+    """Create deterministic normalized directions when no artifact exists in mock mode."""
+
+    rng = np.random.default_rng(0)
+    directions = rng.normal(size=(k, num_layers, d_model))
+    norms = np.linalg.norm(directions, axis=2, keepdims=True)
+    return (directions / np.maximum(norms, 1e-12)).astype(np.float64)
 
 
 def _tokens_from_model(
@@ -209,13 +202,13 @@ def _run_calibration_trial(
     V: np.ndarray,
     P: np.ndarray,
     injection_config: InjectionConfig,
-    llm_config: LLMConfig,
+    inject_layers: list[int],
     prompt: str,
     max_new_tokens: int,
 ) -> dict[int, list[float]]:
     """Run one prompt, injecting substrate-driven deltas at each token."""
 
-    layer_norms: dict[int, list[float]] = {layer: [] for layer in llm_config.inject_layers}
+    layer_norms: dict[int, list[float]] = {layer: [] for layer in inject_layers}
 
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(next(model.parameters()).device)
@@ -230,15 +223,24 @@ def _run_calibration_trial(
             P=P,
             config=injection_config,
         )
-        hook.set_deltas(deltas)
+        if len(deltas) != len(inject_layers):
+            raise ValueError(
+                "direction layer count does not match configured injection layer count"
+            )
+        hook.set_deltas(
+            {
+                model_layer: deltas[position]
+                for position, model_layer in enumerate(inject_layers)
+            }
+        )
         _ = model.generate(
             input_ids,
             max_new_tokens=1,
             do_sample=False,
             pad_token_id=getattr(tokenizer, "pad_token_id", 0),
         )
-        for layer in llm_config.inject_layers:
-            layer_norms[layer].append(record.layer_norms_raw[layer])
+        for position, layer in enumerate(inject_layers):
+            layer_norms[layer].append(record.layer_norms_raw[position])
         input_ids = torch.tensor(
             [_tokens_from_model(model, tokenizer, input_ids, 1)], device=input_ids.device
         )
@@ -252,6 +254,40 @@ def main() -> None:
     config = load_config(args.config)
     llm_config = config.llm
     injection_config = llm_config.injection
+    inject_layers = sorted(llm_config.inject_layers)
+
+    mock_mode = args.device == "mock"
+    device_arg = "cpu" if mock_mode else args.device
+    if device_arg == "auto":
+        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_arg)
+
+    directions_path = Path(args.directions)
+    if directions_path.exists():
+        V = load_directions(directions_path)
+    elif mock_mode:
+        V = build_mock_directions(
+            k=config.substrate.k, num_layers=len(inject_layers)
+        )
+        print(
+            f"Directions file {directions_path} was not found; using deterministic "
+            f"mock directions with shape {V.shape}."
+        )
+    else:
+        raise FileNotFoundError(
+            f"directions file not found: {directions_path}. Run extract_directions.py "
+            "first or pass --directions PATH."
+        )
+    if V.shape[0] != config.substrate.k:
+        raise ValueError(
+            f"directions contain k={V.shape[0]}, expected {config.substrate.k}"
+        )
+    if V.shape[1] != len(inject_layers):
+        raise ValueError(
+            f"directions contain {V.shape[1]} layers, expected "
+            f"{len(inject_layers)}"
+        )
+
     substrate_core = create_core(config.substrate)
     reservoir = Reservoir(
         dim=config.reservoir.dim,
@@ -264,23 +300,24 @@ def main() -> None:
         density=config.reservoir.density,
         seed=config.reservoir.seed,
     )
-    V = load_directions(args.directions)
     P = build_reservoir_projection(
         reservoir_dim=config.reservoir.dim, d_model=V.shape[2], seed=config.reservoir.seed
     )
 
     dtype = dtype_from_string(args.dtype)
-    device_arg = args.device
-    if device_arg == "auto":
-        device_arg = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_arg)
-
-    if device_arg == "mock":
-        model, tokenizer = build_mock_model(llm_config, device)
+    if mock_mode:
+        model, tokenizer = build_mock_model(device, d_model=V.shape[2])
     else:
-        model, tokenizer = load_model(llm_config, device_arg, dtype, args.proxy)
+        model, tokenizer = load_model(
+            llm_config,
+            device_arg,
+            dtype,
+            proxy=args.proxy,
+            local_model_dir=args.local_model_dir,
+            hf_mirror=args.hf_mirror,
+        )
 
-    hook = InjectionHook(model, inject_layers=llm_config.inject_layers)
+    hook = InjectionHook(model, inject_layers=inject_layers)
 
     A_values = [float(x.strip()) for x in args.A_sweep.split(",") if x.strip()]
     cap = injection_config.cap
@@ -308,7 +345,7 @@ def main() -> None:
             V=V,
             P=P,
             injection_config=trial_config,
-            llm_config=llm_config,
+            inject_layers=inject_layers,
             prompt=args.prompt,
             max_new_tokens=args.max_new_tokens,
         )
@@ -333,6 +370,7 @@ def main() -> None:
             print(f"  A = {entry['A']}")
 
     output_path = Path(args.directions).parent / "calibration_summary.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     print(f"\nSaved calibration summary to {output_path}")

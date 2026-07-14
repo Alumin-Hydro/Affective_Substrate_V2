@@ -53,6 +53,10 @@ class InjectionHook:
         """Attach forward hooks to the configured layers."""
 
         layers = self._get_layers()
+        if not layers:
+            # Mock/custom models may intentionally expose no decoder-layer stack.
+            # In that case the hook remains a safe no-op while retaining deltas.
+            return
         for layer_idx in self.inject_layers:
             if layer_idx not in layers:
                 raise ValueError(
@@ -65,13 +69,16 @@ class InjectionHook:
     def _get_layers(self) -> dict[int, nn.Module]:
         """Discover the transformer decoder layers."""
 
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            layers = self.model.model.layers
-            return {i: layer for i, layer in enumerate(layers)}
-        if hasattr(self.model, "layers"):
-            layers = self.model.layers
-            return {i: layer for i, layer in enumerate(layers)}
-        raise ValueError("Could not locate model.layers on the provided model")
+        candidates = [
+            getattr(getattr(self.model, "model", None), "layers", None),
+            getattr(self.model, "layers", None),
+            getattr(getattr(self.model, "transformer", None), "h", None),
+            getattr(getattr(self.model, "gpt_neox", None), "layers", None),
+        ]
+        for candidate in candidates:
+            if candidate is not None:
+                return {i: layer for i, layer in enumerate(candidate)}
+        return {}
 
     def _make_hook(self, layer_idx: int) -> Callable:
         def hook(module: nn.Module, inputs: Any, output: Any) -> Any:
@@ -79,15 +86,18 @@ class InjectionHook:
                 return output
 
             delta = self._deltas[layer_idx]
-            if output.dim() == 3:
+            hidden = output[0] if isinstance(output, (tuple, list)) else output
+            if not isinstance(hidden, torch.Tensor):
+                raise ValueError("hooked layer output does not contain a tensor")
+            if hidden.dim() == 3:
                 # [batch, seq, d_model] -> broadcast across seq
-                delta_broadcast = delta.view(1, 1, -1).expand_as(output)
-            elif output.dim() == 2:
-                delta_broadcast = delta.view(1, -1).expand_as(output)
+                delta_broadcast = delta.view(1, 1, -1).expand_as(hidden)
+            elif hidden.dim() == 2:
+                delta_broadcast = delta.view(1, -1).expand_as(hidden)
             else:
-                raise ValueError(f"unexpected output shape: {output.shape}")
+                raise ValueError(f"unexpected output shape: {hidden.shape}")
 
-            modified = output + delta_broadcast.to(output.dtype).to(output.device)
+            modified = hidden + delta_broadcast.to(hidden.dtype).to(hidden.device)
 
             raw_norm = float(delta.norm(p=2).cpu())
             clipped_norm = raw_norm
@@ -97,7 +107,7 @@ class InjectionHook:
                     clipped_norm = float(self.cap)
                     clip_triggered = True
 
-            hidden_norm = float(output.norm(p=2, dim=-1).mean().cpu())
+            hidden_norm = float(hidden.norm(p=2, dim=-1).mean().cpu())
             ratio = raw_norm / (hidden_norm + 1e-12)
 
             if self._last_record is None:
@@ -110,6 +120,10 @@ class InjectionHook:
                 clip_triggered=clip_triggered,
             )
 
+            if isinstance(output, tuple):
+                return (modified, *output[1:])
+            if isinstance(output, list):
+                return [modified, *output[1:]]
             return modified
 
         return hook
@@ -140,7 +154,7 @@ class InjectionHook:
         self._last_record = None
 
     def remove(self) -> None:
-        """Detach all forward hooks. The hook object should not be reused."""
+        """Detach all forward hooks and clear pending state (idempotent)."""
 
         self._deltas.clear()
         self._last_record = None
@@ -151,6 +165,12 @@ class InjectionHook:
     @property
     def last_record(self) -> InjectionRecord | None:
         return self._last_record
+
+    @property
+    def attached(self) -> bool:
+        """Whether at least one real layer hook is currently registered."""
+
+        return bool(self._handles)
 
     def __enter__(self) -> "InjectionHook":
         return self

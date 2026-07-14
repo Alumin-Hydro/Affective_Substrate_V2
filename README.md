@@ -20,11 +20,11 @@ sweep topped out at λ=0.008877, below the unchanged λ=0.01 threshold.
 
 ```bash
 cd /Users/alumin/Project/Affective_Substrate_V2
-uv sync --group dev
-uv run pytest
-uv run python scripts/gateA_lyapunov.py
-uv run python scripts/gateB_sensitivity.py
-uv run python scripts/run_bare_substrate.py
+source .venv/bin/activate
+python -m pytest tests/ -q
+python scripts/gateA_lyapunov.py
+python scripts/gateB_sensitivity.py
+python scripts/run_bare_substrate.py
 ```
 
 ## Phase 0 Exit
@@ -51,7 +51,12 @@ written for the RTX 5090 Windows/CUDA 12.8 environment.
   `artifacts/directions_meta.json`.
 - `src/llm/hooks.py` — `InjectionHook` based on PyTorch `register_forward_hook`.
   Adds per-layer deltas to the residual stream, records `InjectionRecord` with
-  raw/clipped norm, ratio to hidden, and clip flags.
+  raw/clipped norm, ratio to hidden, and clip flags. Models without a recognized
+  decoder-layer stack are supported as a safe no-op for mock/custom tests;
+  `clear()` resets deltas and `remove()` detaches hooks.
+- `src/llm/model_loading.py` — shared local-snapshot/mirror/proxy model loader.
+  It probes the configured HuggingFace endpoint before remote loading and emits
+  actionable offline fallback instructions if loading fails.
 - `src/llm/projection.py` — `compute_injection(state, r, V, P, config)` computes
   per-layer deltas:
 
@@ -70,29 +75,98 @@ written for the RTX 5090 Windows/CUDA 12.8 environment.
   `Qwen/Qwen2.5-7B-Instruct`, extracts the four affective directions
   (`arousal`, `calm`, `positive`, `negative`), and saves artifacts.
   Supports `--device auto|cuda|cpu|mps`, `--dtype float16|bfloat16|float32`,
-  and `--proxy http://127.0.0.1:7890` for Mac environments.
+  `--local-model-dir`, `--hf-mirror`, and `--proxy`. When both output files
+  already exist, it reuses them before loading a model; pass `--overwrite` to
+  force extraction.
 - `scripts/calibrate_injection.py` — CLI that loads saved directions and runs a
   fixed dummy prompt, sweeps `A_i` values, runs the model with injection
   enabled, and reports the `A_i` values that keep the raw 95th percentile norm
-  below `cap`. Includes a `--device mock` mode for testing on machines without
-  the 7B model.
+  below `cap`. It supports the same model-loading fallbacks. In `--device mock`
+  mode, a missing directions artifact is replaced by deterministic synthetic
+  directions so the complete calibration control flow can run offline.
 
 ### Tests
 
 - `tests/test_projection.py` — dimension contracts, `InjectionRecord` contents,
   invalid-input validation, separate slow directions, and clipping behavior.
   No LLM weights are downloaded.
+- `tests/test_calibrate_mock.py` — mock calibration CLI, no-layer mock hook,
+  tiny PyTorch decoder hook, tuple outputs, cleanup, and extraction reuse.
+- `tests/test_model_loading.py` — proxy/mirror environment setup, local snapshot
+  validation, endpoint failure detection, and actionable error guidance.
+
+### Running on macOS (offline/mock or small local model)
+
+Use the repository virtual environment and CPU/float32 for Mac validation:
+
+```bash
+cd /Users/alumin/Project/Affective_Substrate_V2
+source .venv/bin/activate
+export HTTPS_PROXY=http://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+
+python -m pytest tests/ -q
+python scripts/calibrate_injection.py --device mock --dtype float32 --max_new_tokens 4
+```
+
+The mock command does not download weights. If `artifacts/directions.pt` is
+absent, it reports that synthetic directions are being used and writes only
+`artifacts/calibration_summary.json`.
+
+The test suite also exercises a tiny in-memory PyTorch decoder. To smoke-test a
+real small HuggingFace model already stored on disk, copy `config/default.yaml`
+to a local config and set `llm.model_name` plus `llm.inject_layers` to layers
+that exist in that model, then run both stages against the same snapshot:
+
+```bash
+python scripts/extract_directions.py \
+  --config config/small-local.yaml \
+  --local-model-dir /path/to/small-model-snapshot \
+  --output_dir artifacts/small \
+  --device cpu --dtype float32
+
+python scripts/calibrate_injection.py \
+  --config config/small-local.yaml \
+  --local-model-dir /path/to/small-model-snapshot \
+  --directions artifacts/small/directions.pt \
+  --device cpu --dtype float32 --max_new_tokens 4
+```
 
 ### Running on RTX 5090
 
 The 7B model is **not** downloaded or run on the Mac. On the Windows 5090
-workstation (CUDA 12.8, torch 2.11+cu128), install the project and run:
+workstation (CUDA 12.8, torch 2.11+cu128), use a complete local model snapshot
+when direct HuggingFace 443 access is unavailable:
 
-```bash
-uv sync --group dev
-uv run python scripts/extract_directions.py --device cuda --dtype bfloat16
-uv run python scripts/calibrate_injection.py --device cuda --dtype bfloat16
+```powershell
+.venv\Scripts\python.exe scripts\extract_directions.py `
+  --local-model-dir D:\models\Qwen2.5-7B-Instruct `
+  --device cuda --dtype bfloat16
+
+.venv\Scripts\python.exe scripts\calibrate_injection.py `
+  --local-model-dir D:\models\Qwen2.5-7B-Instruct `
+  --device cuda --dtype bfloat16
 ```
+
+`--local-model-dir` must point to the model/snapshot directory containing
+`config.json`, tokenizer files, and all weight shards—not merely the parent HF
+cache directory. Extraction skips model loading when both `directions.pt` and
+`directions_meta.json` already exist. Use `--overwrite` only when a fresh
+extraction is intended.
+
+If a mirror is reachable, either form below is supported:
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+.venv\Scripts\python.exe scripts\extract_directions.py --device cuda --dtype bfloat16
+
+# Equivalent one-command form; an explicit URL may follow --hf-mirror.
+.venv\Scripts\python.exe scripts\extract_directions.py --hf-mirror --device cuda --dtype bfloat16
+```
+
+Remote loading performs a short endpoint check. A failed load reports whether
+the endpoint was reachable and suggests `--local-model-dir`, `--hf-mirror` /
+`HF_ENDPOINT`, and `HTTPS_PROXY` / `--proxy` as concrete recovery options.
 
 If PyTorch wheels need to be installed manually for sm_120, see
 `pyproject.toml` and install the CUDA 12.8 build before `uv sync`.
