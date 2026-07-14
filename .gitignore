@@ -4,9 +4,11 @@ __pycache__/
 *.pyo
 *.egg-info/
 *.log
-artifacts/figures/*.png
-artifacts/*.json
-artifacts/*.jsonl
+artifacts/*.png
+artifacts/*.pt
+artifacts/*.safetensors
+artifacts/directions_meta.json
+artifacts/calibration_summary.json
 !artifacts/gate_results.json
 !artifacts/kernel_sweep.json
 *.png
